@@ -7,14 +7,13 @@ import nlpaug.augmenter.char as nac
 import nlpaug.augmenter.word as naw
 from textaugment import Wordnet, EDA
 import transformers
-import nltk
 import torch as th
 from datasets import Dataset, load_dataset, list_metrics, load_metric
 from random import randint
 from transformers import pipeline
 import re
 
-flags.DEFINE_integer('epochs', 6, '')
+flags.DEFINE_integer('epochs', 2, '')
 flags.DEFINE_integer('batch_size', 32, '')
 flags.DEFINE_float('lr', 1e-2, '')
 flags.DEFINE_float('momentum', .9, '')
@@ -22,20 +21,19 @@ flags.DEFINE_string('model', 'bert-base-uncased', '')
 flags.DEFINE_boolean('debug', False, '')
 flags.DEFINE_boolean('augmentation', False, '')
 flags.DEFINE_string('concept', 'Anxiety', '' )
-flags.DEFINE_boolean('classification_task', True, '')
-flags.DEFINE_boolean('balance', True, '')
+flags.DEFINE_boolean('balance', False, '')
 
 FLAGS = flags.FLAGS
 
 class BertModel(pl.LightningModule):
     def __init__(self):
         super().__init__()
-        if FLAGS.classification_task:
+        if FLAGS.concept == 'NEOPIP':
+            self.model = transformers.BertForSequenceClassification.from_pretrained(FLAGS.model, num_labels=5)
+            self.loss = th.nn.BCEWithLogitsLoss(reduction="none")
+        else:
             self.model = transformers.BertForSequenceClassification.from_pretrained(FLAGS.model)
             self.loss = th.nn.CrossEntropyLoss(reduction="none")
-        else:
-            self.model = transformers.BertForSequenceClassification.from_pretrained(FLAGS.model, num_labels=5)
-            self.loss = th.nn.MSELoss(reduction="none")
 
     def prepare_data(self):
         pass
@@ -46,18 +44,32 @@ class BertModel(pl.LightningModule):
         return logits
 
     def training_step(self, batch, batch_idx):
-        if FLAGS.classification_task == False:
+        if FLAGS.concept == 'NEOPIP':
             batch['label'] = batch['label'].type(th.FloatTensor)
         logits = self.forward(batch['input_ids'])
         loss = self.loss(logits, batch['label']).mean()
         return {'loss': loss, 'log': {'train_loss': loss}}
 
     def validation_step(self, batch, batch_idx):
-        if FLAGS.classification_task == False:
+        if FLAGS.concept == 'NEOPIP':
             batch['label'] = batch['label'].type(th.FloatTensor)
         logits = self.forward(batch['input_ids'])
         loss = self.loss(logits,batch['label'])
-        if FLAGS.classification_task:
+        print("batch['label']: ", batch['label'])
+        print("logits: ", logits)
+        if FLAGS.concept == 'NEOPIP':
+            acc = (logits.round() == batch['label']).float()
+            TP = th.sum(((logits.round() == 1) & (batch['label'] == 1)).float(), dim=1)
+            print("TP: ", TP)
+            FP = th.sum(((logits.round() == 1) & (batch['label'] == 0)).float(), dim=1)
+            print("FP: ", FP)
+            FN = th.sum(((logits.round() == 0) & (batch['label'] == 1)).float(), dim=1)
+            prec = TP / (FP + TP)
+            prec = prec.mean()
+            prec[th.isnan(prec)] = 0.
+            rec = (TP / (TP + FN)).mean()
+            rec[th.isnan(rec)] = 0.
+        else:
             TP = sum(((logits.argmax(-1) == 1) & (batch['label'] == 1)).int())
             FP = sum(((logits.argmax(-1) == 1) & (batch['label'] == 0)).int())
             FN = sum(((logits.argmax(-1) == 0) & (batch['label'] == 1)).int())
@@ -66,33 +78,19 @@ class BertModel(pl.LightningModule):
             prec[th.isnan(prec)] = 0.
             rec = TP / (TP + FN)
             rec[th.isnan(rec)] = 0.
-            f1 = (2 * prec * rec) / (prec + rec)
-            f1[th.isnan(f1)] = 0.
-        else:
-            acc = 0.
-            prec = 0.
-            rec = 0.
-            f1 = 0.
+        f1 = (2 * prec * rec) / (prec + rec)
+        f1[th.isnan(f1)] = 0.
         return {'loss': loss, 'acc': acc, 'prec': prec, 'rec': rec, 'f1': f1}
 
     def validation_epoch_end(self, outputs):
-        print("outputs: ", outputs)
         loss = th.cat([o['loss'] for o in outputs], 0).mean()
-        if FLAGS.classification_task:
-            acc = th.cat([o['acc'] for o in outputs], 0).mean()
-            prec = [o['prec'] for o in outputs]
-            prec = th.mean(th.stack(prec))
-            rec = [o['rec'] for o in outputs]
-            rec = th.mean(th.stack(rec))
-            f1 = [o['f1'] for o in outputs]
-            f1 = th.mean(th.stack(f1))
-        else:
-            acc = 0.
-            prec = 0.
-            rec = 0.
-            f1 = 0.
-        #acc = [o['acc'] for o in outputs]
-
+        acc = th.cat([o['acc'] for o in outputs], 0).mean()
+        prec = [o['prec'] for o in outputs]
+        prec = th.mean(th.stack(prec))
+        rec = [o['rec'] for o in outputs]
+        rec = th.mean(th.stack(rec))
+        f1 = [o['f1'] for o in outputs]
+        f1 = th.mean(th.stack(f1))
         self.out = {'val_loss': loss, 'val_acc': acc, 'val_prec': prec, 'val_rec': rec, 'val_f1': f1}
         print("out: ", self.out)
         return {**self.out, 'log': self.out}
@@ -194,17 +192,22 @@ def _prepare_ds():
         counter = len(split)
         for item in split:
             sequence = re.sub('\\n', ' ', item['item'])
+            print(sequence)
             label = item['label']
             words = sequence.split(' ')
             masked_sequences = _get_mask_pipeline(words)
             eda_sequences = _get_eda(sequence)
             nlpaug_sequences = _get_nlp_aug(sequence)
             sequence = list(set([sequence] + masked_sequences + eda_sequences + nlpaug_sequences))
+            print(sequence)
             label = [label for i in range(len(sequence))]
             augmented['item'] += sequence
             augmented['label'] += label
             counter -= 1
             print("added ", len(sequence), " augmentations to item.", counter, "to go")
+            import IPython;
+            IPython.embed();
+            exit(1)
         return augmented
 
     def _get_more_control_samples(split):
@@ -224,7 +227,7 @@ def _prepare_ds():
         # compute missing control samples
         missing_control = count_case - count_control
         for i in range(missing_control):
-            with open(r'/mount/studenten5/projects/kreuteae/BaselineModel/Control_Samples.json', encoding="utf8") as control_items:
+            with open(r'C:\Users\Anne\AppData\Roaming\JetBrains\PyCharmCE2020.2\scratches\Control_Samples.json', encoding="utf8") as control_items:
                 control_items = json.load(control_items)
                 K = randint(0, len(control_items["data"]) - 1)
                 control_item = control_items["data"][K]
@@ -236,8 +239,8 @@ def _prepare_ds():
 
 
     def _load_dataset():
-        ds_test = load_dataset('json', data_files=r'/mount/studenten5/projects/kreuteae/BaselineModel/%s.json' %FLAGS.concept, field='data', split=[f'train[{k}%:{k+20}%]' for k in range(0, 100, 20)])
-        ds_train = load_dataset('json', data_files=r'/mount/studenten5/projects/kreuteae/BaselineModel/%s.json' %FLAGS.concept, field='data', split=[f'train[:{k}%]+train[{k+20}%:]' for k in range(0, 100, 20)])
+        ds_test = load_dataset('json', data_files=r'C:\Users\Anne\AppData\Roaming\JetBrains\PyCharmCE2020.2\scratches\%s.json' %FLAGS.concept, field='data', split=[f'train[{k}%:{k+10}%]' for k in range(0, 100, 10)])
+        ds_train = load_dataset('json', data_files=r'C:\Users\Anne\AppData\Roaming\JetBrains\PyCharmCE2020.2\scratches\%s.json' %FLAGS.concept, field='data', split=[f'train[:{k}%]+train[{k+10}%:]' for k in range(0, 100, 10)])
         list_of_ds_train = []
         list_of_ds_test = []
         for split in ds_train:
@@ -274,11 +277,10 @@ def main(_):
     list_of_ds_train, list_of_ds_test = _prepare_ds()
     performance = {}
     performance['mse'] = []
-    if FLAGS.classification_task == True:
-        performance['acc'] = []
-        performance['prec'] = []
-        performance['rec'] = []
-        performance['f1'] = []
+    performance['acc'] = []
+    performance['prec'] = []
+    performance['rec'] = []
+    performance['f1'] = []
 
     for i in range(len(list_of_ds_train)):
         print("******************* Round No. ", i+1, " *******************")
@@ -298,19 +300,18 @@ def main(_):
         trainer.fit(model)
         mse = model.out['val_loss']
         performance['mse'].append(mse.item())
-        if FLAGS.classification_task == True:
-            acc = model.out['val_acc']
-            prec = model.out['val_prec']
-            rec = model.out['val_rec']
-            f1 = model.out['val_f1']
-            performance['acc'].append(acc.item())
-            performance['prec'].append(prec.item())
-            performance['rec'].append(rec.item())
-            performance['f1'].append(f1.item())
-        print("performance summary until now:", performance)
+        acc = model.out['val_acc']
+        prec = model.out['val_prec']
+        rec = model.out['val_rec']
+        f1 = model.out['val_f1']
+        performance['acc'].append(acc.item())
+        performance['prec'].append(prec.item())
+        performance['rec'].append(rec.item())
+        performance['f1'].append(f1.item())
 
     for key, values in performance.items():
         print(key, ": ", statistics.mean(values))
+
     ende = time.time()
     print('{:5.3f}s'.format(ende - start))
 
